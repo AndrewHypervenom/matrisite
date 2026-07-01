@@ -50,6 +50,11 @@ const EXCLUDE_DIR = [
   "node_modules/", "dist/", "build/", ".next/", "out/", "vendor/",
   ".git/", "coverage/", "__pycache__/", ".venv/", "venv/", "target/",
   ".turbo/", ".cache/", "public/assets/",
+  // Tooling/agent scaffolding and generated code: these are not the project's
+  // own source, but their docs (e.g. .agents/skills/**/SKILL.md) otherwise
+  // dominate semantic search and make the chat answer about the tooling
+  // instead of the actual codebase.
+  ".agents/", ".claude/", ".cursor/", ".github/", "_generated/",
 ];
 
 const EXCLUDE_FILE = [
