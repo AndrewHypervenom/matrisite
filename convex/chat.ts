@@ -250,14 +250,29 @@ export const answer = internalAction({
       conversationId,
     });
 
-    try {
-      const { text } = await generateText({
-        model: getModel(mode as ChatMode),
+    const runAgent = (model: ReturnType<typeof getModel>) =>
+      generateText({
+        model,
         system: systemPrompt(mode as ChatMode, slug),
         messages: history as any,
         tools,
         stopWhen: stepCountIs(10),
       });
+
+    try {
+      let text: string;
+      try {
+        ({ text } = await runAgent(getModel(mode as ChatMode)));
+      } catch (primaryErr) {
+        // Groq ("ask" mode) occasionally fails tool calling with
+        // "Failed to call a function". Fall back to Gemini, which handles the
+        // same tools reliably, so the user still gets an answer.
+        if (mode === "ask") {
+          ({ text } = await runAgent(getModel("plan")));
+        } else {
+          throw primaryErr;
+        }
+      }
 
       const topCitations = [...citations.values()]
         .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))

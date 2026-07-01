@@ -13,8 +13,11 @@ dist-ssr
 *.local
 .env.local
 
-# Convex generated code (recreated by `npx convex dev`)
-convex/_generated
+# Convex local temp dir (if you set CONVEX_TMPDIR here)
+.convextmp
+
+# Claude Code
+.claude
 
 # Editor directories and files
 .vscode/*

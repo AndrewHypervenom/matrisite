@@ -83,14 +83,17 @@ export function RepoBar({
         </>
       )}
 
-      <form onSubmit={onAdd} className="ml-auto flex items-center gap-1">
+      <form
+        onSubmit={onAdd}
+        className="flex flex-1 items-center gap-1 min-w-[12rem]"
+      >
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="owner/repo"
-          className="w-44 rounded-lg bg-white/10 px-2 py-1.5 text-sm outline-none placeholder:text-white/30"
+          placeholder="owner/repo o URL de GitHub"
+          className="min-w-0 flex-1 rounded-lg bg-white/10 px-3 py-1.5 text-sm outline-none placeholder:text-white/30"
         />
-        <button className="rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-white hover:opacity-90">
+        <button className="shrink-0 rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-white hover:opacity-90">
           Añadir
         </button>
       </form>

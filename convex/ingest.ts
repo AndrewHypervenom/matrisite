@@ -12,7 +12,9 @@ import {
 } from "./github";
 
 const MAX_FILES = 600; // safety cap for a single index pass
-const CONCURRENCY = 8;
+// Voyage's free tier is aggressively rate-limited (especially without a payment
+// method on file). Index serially and back off on 429 so a full pass completes.
+const CONCURRENCY = 1;
 
 type RepoDoc = {
   _id: any;
@@ -133,25 +135,27 @@ async function indexOneFile(
   const symbols = extractSymbols(path, content);
   if (chunks.length === 0) return 0;
 
-  await rag.add(ctx, {
-    namespace: repoId,
-    key: path,
-    title: path,
-    metadata: { path, url: fileUrl(repo.owner, repo.name, sha, path) },
-    // Dedup: unchanged content (same hash) won't be re-embedded.
-    contentHash: blobSha,
-    chunks: chunks.map((c) => ({
-      text: c.text,
-      metadata: {
-        path,
-        startLine: c.startLine,
-        endLine: c.endLine,
-        symbol: c.symbol ?? "",
-        language: c.language,
-      },
-      keywords: c.symbol ? `${path} ${c.symbol}` : path,
-    })),
-  });
+  await withRetry(() =>
+    rag.add(ctx, {
+      namespace: repoId,
+      key: path,
+      title: path,
+      metadata: { path, url: fileUrl(repo.owner, repo.name, sha, path) },
+      // Dedup: unchanged content (same hash) won't be re-embedded.
+      contentHash: blobSha,
+      chunks: chunks.map((c) => ({
+        text: c.text,
+        metadata: {
+          path,
+          startLine: c.startLine,
+          endLine: c.endLine,
+          symbol: c.symbol ?? "",
+          language: c.language,
+        },
+        keywords: c.symbol ? `${path} ${c.symbol}` : path,
+      })),
+    }),
+  );
 
   await ctx.runMutation(internal.repos.upsertFile, {
     repoId,
@@ -163,6 +167,29 @@ async function indexOneFile(
   });
 
   return chunks.length;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Retry a rate-limited embedding call with exponential backoff. Voyage returns
+ * 429 ("Too Many Requests") when the free-tier limit is exceeded; waiting and
+ * retrying lets a full index pass finish instead of aborting the whole repo.
+ */
+async function withRetry<T>(fn: () => Promise<T>, attempts = 6): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const msg = String(err?.message ?? err);
+      const rateLimited = /Too Many Requests|429|rate.?limit/i.test(msg);
+      if (!rateLimited || i === attempts - 1) throw err;
+      lastErr = err;
+      await sleep(Math.min(30_000, 3_000 * 2 ** i)); // 3s,6s,12s,24s,30s…
+    }
+  }
+  throw lastErr;
 }
 
 /** Bounded-concurrency map. */
