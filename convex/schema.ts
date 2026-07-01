@@ -24,6 +24,10 @@ export default defineSchema({
     // Live progress while status === "indexing" (drained batch by batch).
     filesProcessed: v.optional(v.number()),
     filesTotal: v.optional(v.number()),
+    // Monotonic index generation. Bumped when a fresh index starts or a watchdog
+    // resumes a stalled one; any scheduled batch carrying an older epoch is a
+    // superseded chain and stops itself, so recoveries never spawn duplicates.
+    indexEpoch: v.optional(v.number()),
   }).index("by_owner_name", ["owner", "name"]),
 
   // Flattened file tree of the latest indexed commit (the "repo map").

@@ -35,11 +35,30 @@ const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
 // that succeeds resets the counter.
 const MAX_STALLED_BATCHES = 6;
 
+// A batch that reaches its own scheduling code always reschedules the next one,
+// so the repo can only strand if Convex *hard-kills* the action at its 600s
+// ceiling — which happens when a single oversized file monopolises the whole
+// budget (many chunk embeddings, worse under provider throttling). A kill is not
+// a catchable error, so the batch's reschedule/error handling never runs and the
+// repo is left on "indexing" forever. Guard against exactly that: every batch
+// arms a watchdog *before* touching the network. A healthy batch cancels it on
+// the way out; a killed batch never reaches the cancel, so the watchdog fires,
+// takes over (new epoch), and resumes from what's already persisted. It must
+// fire comfortably before the 600s kill.
+const WATCHDOG_DELAY_MS = 9 * 60 * 1000; // 540s < 600s hard limit
+// Stop retrying if consecutive watchdog recoveries embed zero new files — a
+// single pathological file is blocking the whole index, so surface a clear error
+// instead of looping forever.
+const MAX_RECOVERIES = 3;
+
 type RepoDoc = {
   _id: any;
   owner: string;
   name: string;
   defaultBranch?: string;
+  status?: string;
+  indexEpoch?: number;
+  chunkCount?: number;
 };
 
 // One file's worth of work queued for a batch. `blobSha` is present for a full
@@ -77,6 +96,9 @@ export const indexRepo = internalAction({
         filesTotal: targets.length,
       });
 
+      const epoch = await ctx.runMutation(internal.repos.bumpIndexEpoch, {
+        repoId,
+      });
       await ctx.scheduler.runAfter(0, internal.ingest.indexBatch, {
         repoId,
         sha,
@@ -85,6 +107,7 @@ export const indexRepo = internalAction({
         queue: targets.map((e) => ({ path: e.path, blobSha: e.sha })),
         totalFiles: targets.length,
         chunkTotal: 0,
+        epoch,
       });
     } catch (err: any) {
       await ctx.runMutation(internal.repos.setStatus, {
@@ -134,6 +157,9 @@ export const reindexChangedPaths = internalAction({
       filesProcessed: 0,
       filesTotal: changed.length,
     });
+    const epoch = await ctx.runMutation(internal.repos.bumpIndexEpoch, {
+      repoId,
+    });
     await ctx.scheduler.runAfter(0, internal.ingest.indexBatch, {
       repoId,
       sha,
@@ -141,6 +167,7 @@ export const reindexChangedPaths = internalAction({
       queue: changed.map((path) => ({ path })),
       totalFiles: changed.length,
       chunkTotal: 0,
+      epoch,
     });
   },
 });
@@ -163,6 +190,12 @@ export const indexBatch = internalAction({
     // Count of consecutive prior batches that made zero progress due to rate
     // limiting. Absent on the first batch.
     stalls: v.optional(v.number()),
+    // Index generation this batch belongs to (see repos.bumpIndexEpoch). Absent
+    // on legacy in-flight batches; treated as 0.
+    epoch: v.optional(v.number()),
+    // Consecutive watchdog recoveries that embedded no new files. Absent until a
+    // recovery happens.
+    recoveries: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const { repoId, sha, branch, mode, queue, totalFiles } = args;
@@ -170,6 +203,28 @@ export const indexBatch = internalAction({
       repoId,
     })) as RepoDoc | null;
     if (!repo) return;
+
+    // Superseded chain (a watchdog recovery already took over)? Do nothing.
+    if ((repo.indexEpoch ?? 0) > (args.epoch ?? 0)) return;
+
+    // Arm the recovery watchdog *before* any embedding work, so a hard kill at
+    // the 600s ceiling still leaves someone to resume. The finally block cancels
+    // it once this batch reaches its own (re)scheduling logic.
+    const watchdogId = await ctx.scheduler.runAfter(
+      WATCHDOG_DELAY_MS,
+      internal.ingest.watchdog,
+      {
+        repoId,
+        sha,
+        branch,
+        mode,
+        queue,
+        totalFiles,
+        epoch: args.epoch ?? 0,
+        recoveries: args.recoveries ?? 0,
+        checkpoint: totalFiles - queue.length,
+      },
+    );
 
     try {
       const deadline = Date.now() + BATCH_BUDGET_MS;
@@ -263,7 +318,125 @@ export const indexBatch = internalAction({
         status: "error",
         lastError: String(err?.message ?? err),
       });
+    } finally {
+      // This batch reached its own scheduling/error path, so the watchdog is no
+      // longer needed. Cancelling a job that already fired is a harmless no-op.
+      try {
+        await ctx.scheduler.cancel(watchdogId);
+      } catch {
+        /* already ran or cancelled */
+      }
     }
+  },
+});
+
+/**
+ * Recovery watchdog. Armed by every batch and normally cancelled when that batch
+ * finishes cleanly. It only actually runs if a batch was hard-killed by Convex's
+ * 600s action limit (the one failure mode the batch itself can't recover from,
+ * since a kill skips all catch/finally logic). When it runs, it re-derives the
+ * remaining work from persisted state and resumes under a fresh epoch, so the
+ * repo can never be stranded on "indexing".
+ */
+export const watchdog = internalAction({
+  args: {
+    repoId: v.id("repos"),
+    sha: v.string(),
+    branch: v.optional(v.string()),
+    mode: v.string(),
+    queue: v.array(queueItem),
+    totalFiles: v.number(),
+    epoch: v.number(),
+    recoveries: v.number(),
+    // filesProcessed at the moment this watchdog was armed; used to tell whether
+    // the killed batch managed to make any progress before dying.
+    checkpoint: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const repo = (await ctx.runQuery(internal.repos.getRepoInternal, {
+      repoId: args.repoId,
+    })) as RepoDoc | null;
+    if (!repo) return;
+    // Index already finished or errored, or a newer generation owns it: nothing
+    // to recover.
+    if (repo.status !== "indexing") return;
+    if ((repo.indexEpoch ?? 0) > args.epoch) return;
+
+    // Work still to do. For a full index the files table was cleared at the
+    // start, so anything in it was completed this run and can be skipped. An
+    // incremental push's table also holds pre-existing files, so presence can't
+    // prove completion — just replay the whole batch (embedding is idempotent).
+    let remaining = args.queue;
+    if (args.mode === "full") {
+      const done = new Set(
+        await ctx.runQuery(internal.repos.indexedPaths, {
+          repoId: args.repoId,
+        }),
+      );
+      remaining = args.queue.filter((it) => !done.has(it.path));
+    }
+    const processed = args.totalFiles - remaining.length;
+
+    await ctx.runMutation(internal.repos.setProgress, {
+      repoId: args.repoId,
+      filesProcessed: processed,
+      filesTotal: args.totalFiles,
+    });
+
+    // Everything was actually embedded before the kill — just finalise.
+    if (remaining.length === 0) {
+      if (args.mode === "full") {
+        await ctx.runMutation(internal.repos.finishIndex, {
+          repoId: args.repoId,
+          sha: args.sha,
+          fileCount: args.totalFiles,
+          chunkCount: repo.chunkCount ?? 0,
+          indexedAt: Date.now(),
+          defaultBranch: args.branch,
+        });
+      } else {
+        await ctx.runMutation(internal.repos.finishIndexIncremental, {
+          repoId: args.repoId,
+          sha: args.sha,
+          indexedAt: Date.now(),
+        });
+      }
+      return;
+    }
+
+    // Loop guard: if recovery after recovery embeds zero new files, one file is
+    // blocking the index (too large, or the provider is hard-throttling it).
+    // Surface a clear error rather than resuming forever.
+    const madeProgress = processed > args.checkpoint;
+    const recoveries = madeProgress ? 0 : args.recoveries + 1;
+    if (recoveries > MAX_RECOVERIES) {
+      await ctx.runMutation(internal.repos.setStatus, {
+        repoId: args.repoId,
+        status: "error",
+        lastError:
+          "El indexado se detuvo: un archivo agota el límite de tiempo de " +
+          "Convex (probablemente demasiado grande, o el proveedor de embeddings " +
+          "lo está limitando). Se reintentó varias veces sin avanzar.",
+      });
+      return;
+    }
+
+    // Take ownership with a fresh epoch so the killed batch's chain (if somehow
+    // still alive) becomes stale, then resume the remaining files.
+    const epoch = await ctx.runMutation(internal.repos.bumpIndexEpoch, {
+      repoId: args.repoId,
+    });
+    await ctx.scheduler.runAfter(0, internal.ingest.indexBatch, {
+      repoId: args.repoId,
+      sha: args.sha,
+      branch: args.branch,
+      mode: args.mode,
+      queue: remaining,
+      totalFiles: args.totalFiles,
+      chunkTotal: 0,
+      epoch,
+      recoveries,
+    });
   },
 });
 

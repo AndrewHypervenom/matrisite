@@ -86,6 +86,37 @@ export const getRepoInternal = internalQuery({
   handler: async (ctx, { repoId }) => ctx.db.get(repoId),
 });
 
+/**
+ * Bump the index generation and return the new value. Called when a full/
+ * incremental index begins and again whenever the watchdog resumes a stalled
+ * one. A batch whose carried epoch is below the repo's current epoch belongs to
+ * a superseded chain and must abort, which is how recoveries avoid duplicating
+ * a still-alive (about-to-be-killed) batch.
+ */
+export const bumpIndexEpoch = internalMutation({
+  args: { repoId: v.id("repos") },
+  handler: async (ctx, { repoId }) => {
+    const repo = await ctx.db.get(repoId);
+    const epoch = ((repo?.indexEpoch ?? 0) as number) + 1;
+    await ctx.db.patch(repoId, { indexEpoch: epoch });
+    return epoch;
+  },
+});
+
+/** Paths already written to the repo map — i.e. files finished this run (the
+ * table is cleared at the start of every full index). Used by the watchdog to
+ * skip completed files when resuming. */
+export const indexedPaths = internalQuery({
+  args: { repoId: v.id("repos") },
+  handler: async (ctx, { repoId }) => {
+    const rows = await ctx.db
+      .query("files")
+      .withIndex("by_repo", (q) => q.eq("repoId", repoId))
+      .collect();
+    return rows.map((r) => r.path);
+  },
+});
+
 export const findRepo = internalQuery({
   args: { owner: v.string(), name: v.string() },
   handler: async (ctx, { owner, name }) => {
