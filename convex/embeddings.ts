@@ -63,12 +63,16 @@ function withRateLimitGovernor<M extends object>(model: M): M {
   const doEmbed = (model as any).doEmbed.bind(model);
 
   const governed = async (options: any) => {
+    // Pace ONCE per call (not per retry): spacing keeps us under the limit for
+    // the happy path, and once we're in 429-backoff the backoff itself is the
+    // spacing — adding the pace on top of every retry only inflates worst-case
+    // time per file and risks blowing Convex's 600s action limit mid-batch.
+    if (EMBED_MIN_INTERVAL_MS > 0) {
+      const wait = lastEmbedAt + EMBED_MIN_INTERVAL_MS - Date.now();
+      if (wait > 0) await sleep(wait);
+    }
     let lastErr: unknown;
     for (let i = 0; i < EMBED_MAX_RETRIES; i++) {
-      if (EMBED_MIN_INTERVAL_MS > 0) {
-        const wait = lastEmbedAt + EMBED_MIN_INTERVAL_MS - Date.now();
-        if (wait > 0) await sleep(wait);
-      }
       try {
         const res = await doEmbed(options);
         lastEmbedAt = Date.now();

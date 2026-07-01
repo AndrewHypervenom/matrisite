@@ -21,9 +21,12 @@ const MAX_FILES = 600; // safety cap for a single index pass
 // until a time budget is hit, then schedules the next batch until the queue is
 // drained.
 //
-// Kept under the 600s action limit with room for one file's worst-case retry
-// ladder (~135s in the governor) to finish after the budget check.
-const BATCH_BUDGET_MS = 5 * 60 * 1000;
+// Kept well under the 600s action limit: the loop only checks this deadline
+// *before* starting a file, so one file that then hits the governor's full
+// retry ladder (~160s worst case) still has to fit. 4min budget + ~160s + I/O
+// slack ≈ 420s, leaving comfortable headroom so Convex never kills the action
+// mid-batch (which would strand the repo in "indexing" forever).
+const BATCH_BUDGET_MS = 4 * 60 * 1000;
 // When a batch is throttled, wait out (roughly) a free-tier reset window before
 // retrying the remaining files, rather than hammering the limit immediately.
 const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
