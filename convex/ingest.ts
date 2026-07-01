@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { rag } from "./rag";
+import { isRateLimit } from "./embeddings";
 import { chunkFile, extractSymbols, shouldIndex, detectLanguage } from "./chunk";
 import {
   getDefaultBranch,
@@ -13,15 +14,23 @@ import {
 
 const MAX_FILES = 600; // safety cap for a single index pass
 // Voyage's free tier is aggressively rate-limited (~3 requests/min without a
-// payment method on file). We embed serially and back off on 429. A large repo
-// therefore can't finish inside Convex's 600s action limit in one shot, so
-// indexing is split into self-rescheduling batches (see `indexBatch`): each
-// invocation embeds files until a time budget is hit, then schedules the next
-// batch until the whole queue is drained.
+// payment method on file). Pacing and 429 backoff live in the embedding model's
+// governor (see `embeddings.ts`); a large repo still can't finish inside
+// Convex's 600s action limit in one shot, so indexing is split into
+// self-rescheduling batches (see `indexBatch`): each invocation embeds files
+// until a time budget is hit, then schedules the next batch until the queue is
+// drained.
 //
-// Keep this comfortably under the 600s action limit. Worst case a single file's
-// retry ladder adds ~90s on top, leaving ample slack.
-const BATCH_BUDGET_MS = 6 * 60 * 1000;
+// Kept under the 600s action limit with room for one file's worst-case retry
+// ladder (~135s in the governor) to finish after the budget check.
+const BATCH_BUDGET_MS = 5 * 60 * 1000;
+// When a batch is throttled, wait out (roughly) a free-tier reset window before
+// retrying the remaining files, rather than hammering the limit immediately.
+const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
+// Give up only after this many *consecutive* batches make zero progress while
+// rate-limited — a genuinely exhausted quota, not a transient blip. Any file
+// that succeeds resets the counter.
+const MAX_STALLED_BATCHES = 6;
 
 type RepoDoc = {
   _id: any;
@@ -148,6 +157,9 @@ export const indexBatch = internalAction({
     queue: v.array(queueItem),
     totalFiles: v.number(),
     chunkTotal: v.number(),
+    // Count of consecutive prior batches that made zero progress due to rate
+    // limiting. Absent on the first batch.
+    stalls: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const { repoId, sha, branch, mode, queue, totalFiles } = args;
@@ -158,19 +170,40 @@ export const indexBatch = internalAction({
 
     try {
       const deadline = Date.now() + BATCH_BUDGET_MS;
+      const done0 = totalFiles - queue.length; // files already indexed before this batch
       let chunkTotal = args.chunkTotal;
       let i = 0;
+      let rateLimited = false;
       while (i < queue.length && Date.now() < deadline) {
         const item = queue[i];
-        chunkTotal += await indexOneFile(
-          ctx,
-          repo,
-          repoId,
-          sha,
-          item.path,
-          item.blobSha,
-        );
+        try {
+          chunkTotal += await indexOneFile(
+            ctx,
+            repo,
+            repoId,
+            sha,
+            item.path,
+            item.blobSha,
+          );
+        } catch (err) {
+          // Rate limit: stop here without advancing past this file, and let the
+          // batch reschedule after a cooldown so the whole repo isn't abandoned
+          // in an "error" state over a transient throttle. Any other error is a
+          // real fault and should surface.
+          if (isRateLimit(err)) {
+            rateLimited = true;
+            break;
+          }
+          throw err;
+        }
         i++;
+        // Live progress: update after each file so the UI bar actually moves
+        // instead of jumping only at batch boundaries.
+        await ctx.runMutation(internal.repos.setProgress, {
+          repoId,
+          filesProcessed: done0 + i,
+          filesTotal: totalFiles,
+        });
       }
 
       const rest = queue.slice(i);
@@ -181,11 +214,27 @@ export const indexBatch = internalAction({
       });
 
       if (rest.length > 0) {
-        await ctx.scheduler.runAfter(0, internal.ingest.indexBatch, {
-          ...args,
-          queue: rest,
-          chunkTotal,
-        });
+        // Track stalls only when a rate limit blocked *all* progress this batch;
+        // any indexed file means we're still making headway, so reset.
+        const madeProgress = i > 0;
+        const stalls = rateLimited && !madeProgress ? (args.stalls ?? 0) + 1 : 0;
+        if (stalls >= MAX_STALLED_BATCHES) {
+          await ctx.runMutation(internal.repos.setStatus, {
+            repoId,
+            status: "error",
+            lastError:
+              "El proveedor de embeddings (Voyage) sigue limitando por rate " +
+              "tras varios reintentos. Espera unos minutos y vuelve a " +
+              "re-indexar, o añade un método de pago en Voyage para subir el " +
+              "límite del tier gratuito.",
+          });
+          return;
+        }
+        await ctx.scheduler.runAfter(
+          rateLimited ? RATE_LIMIT_COOLDOWN_MS : 0,
+          internal.ingest.indexBatch,
+          { ...args, queue: rest, chunkTotal, stalls },
+        );
         return;
       }
 
@@ -233,28 +282,27 @@ async function indexOneFile(
   const symbols = extractSymbols(path, content);
   if (chunks.length === 0) return 0;
 
-  await paceEmbedding();
-  await withRetry(() =>
-    rag.add(ctx, {
-      namespace: repoId,
-      key: path,
-      title: path,
-      metadata: { path, url: fileUrl(repo.owner, repo.name, sha, path) },
-      // Dedup: unchanged content (same hash) won't be re-embedded.
-      contentHash: blobSha,
-      chunks: chunks.map((c) => ({
-        text: c.text,
-        metadata: {
-          path,
-          startLine: c.startLine,
-          endLine: c.endLine,
-          symbol: c.symbol ?? "",
-          language: c.language,
-        },
-        keywords: c.symbol ? `${path} ${c.symbol}` : path,
-      })),
-    }),
-  );
+  // Pacing and 429 backoff are handled by the embedding model's governor
+  // (see `embeddings.ts`), so this call stays a plain add.
+  await rag.add(ctx, {
+    namespace: repoId,
+    key: path,
+    title: path,
+    metadata: { path, url: fileUrl(repo.owner, repo.name, sha, path) },
+    // Dedup: unchanged content (same hash) won't be re-embedded.
+    contentHash: blobSha,
+    chunks: chunks.map((c) => ({
+      text: c.text,
+      metadata: {
+        path,
+        startLine: c.startLine,
+        endLine: c.endLine,
+        symbol: c.symbol ?? "",
+        language: c.language,
+      },
+      keywords: c.symbol ? `${path} ${c.symbol}` : path,
+    })),
+  });
 
   await ctx.runMutation(internal.repos.upsertFile, {
     repoId,
@@ -266,56 +314,4 @@ async function indexOneFile(
   });
 
   return chunks.length;
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * Proactive throttle between embedding requests.
- *
- * Voyage's free tier without a payment method allows only ~3 requests/min, so
- * embedding files back-to-back immediately trips 429 and burns the retry budget
- * on every file — a large repo then fails outright ("Too Many Requests"). By
- * spacing calls out to at most one per `EMBED_MIN_INTERVAL_MS` we mostly stay
- * under the limit and let `withRetry` handle the occasional overflow instead of
- * fighting the limit head-on. Default 20s ≈ 3/min (matching the free tier); set
- * `EMBED_MIN_INTERVAL_MS=0` once a Voyage payment method lifts the cap.
- *
- * State is module-level and resets each action invocation, which is exactly the
- * scope we want: pacing only needs to hold within a single batch.
- */
-const EMBED_MIN_INTERVAL_MS = Number(
-  process.env.EMBED_MIN_INTERVAL_MS ?? 20_000,
-);
-let lastEmbedAt = 0;
-async function paceEmbedding(): Promise<void> {
-  if (EMBED_MIN_INTERVAL_MS <= 0) return;
-  const wait = lastEmbedAt + EMBED_MIN_INTERVAL_MS - Date.now();
-  if (wait > 0) await sleep(wait);
-  lastEmbedAt = Date.now();
-}
-
-/**
- * Retry a rate-limited embedding call with exponential backoff. Voyage returns
- * 429 ("Too Many Requests") when the free-tier limit is exceeded; waiting and
- * retrying lets a full index pass finish instead of aborting the whole repo.
- * Backoff ramps to a full minute because the free-tier limit resets per-minute,
- * so shorter waits keep colliding with the same window.
- */
-async function withRetry<T>(fn: () => Promise<T>, attempts = 8): Promise<T> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      const msg = String(err?.message ?? err);
-      const rateLimited = /Too Many Requests|429|rate.?limit/i.test(msg);
-      if (!rateLimited || i === attempts - 1) throw err;
-      lastErr = err;
-      // 5s,10s,20s,40s,60s,60s,60s… plus jitter to desync retries.
-      const backoff = Math.min(60_000, 5_000 * 2 ** i);
-      await sleep(backoff + Math.random() * 1_000);
-    }
-  }
-  throw lastErr;
 }
