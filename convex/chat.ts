@@ -260,23 +260,42 @@ export const answer = internalAction({
       });
 
     try {
-      let text: string;
-      try {
-        ({ text } = await runAgent(getModel(mode as ChatMode)));
-      } catch (primaryErr) {
-        // Groq ("ask" mode) occasionally fails tool calling with
-        // "Failed to call a function". Fall back to Gemini, which handles the
-        // same tools reliably, so the user still gets an answer.
-        if (mode === "ask") {
-          ({ text } = await runAgent(getModel("plan")));
-        } else {
-          throw primaryErr;
-        }
-      }
+      // Provider chain per mode. Each mode's primary provider is tried first,
+      // then the other as a fallback so a quota/tool-calling failure on one
+      // still yields an answer:
+      //   ask  → Groq  then Gemini
+      //   plan → Gemini then Groq
+      // Within each provider we retry on rate-limit (429 / quota) with backoff
+      // before moving on.
+      const chain: ChatMode[] =
+        (mode as ChatMode) === "plan" ? ["plan", "ask"] : ["ask", "plan"];
 
-      const topCitations = [...citations.values()]
-        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-        .slice(0, 8);
+      let text: string | undefined;
+      let lastErr: unknown;
+      for (const providerMode of chain) {
+        const model = getModel(providerMode);
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            ({ text } = await runAgent(model));
+            break;
+          } catch (err) {
+            lastErr = err;
+            // Rate-limited: wait and retry the same provider before failing over.
+            if (isRateLimited(err) && attempt < 2) {
+              await sleep(2_000 * 2 ** attempt); // 2s, 4s
+              continue;
+            }
+            break; // non-retryable (or retries exhausted) → next provider
+          }
+        }
+        if (text !== undefined) break;
+      }
+      if (text === undefined) throw lastErr;
+
+      const topCitations = selectRelevantCitations(
+        [...citations.values()],
+        text,
+      );
 
       await ctx.runMutation(internal.chat.writeAssistant, {
         messageId: assistantMessageId,
@@ -294,12 +313,59 @@ export const answer = internalAction({
   },
 });
 
+/**
+ * Keep only the citations the answer actually refers to.
+ *
+ * Every searchCode/readFile call this turn records a citation, so the raw list
+ * includes files the agent merely glanced at while exploring. The system prompt
+ * makes the model cite real code inline as `path:line`, so we treat the answer
+ * text as the source of truth: a citation is "relevant" when its path (or file
+ * name) appears in the answer. Relevant ones come first (ordered by score), and
+ * we only fall back to top-scored explorational hits if the model cited nothing.
+ */
+function selectRelevantCitations(
+  all: Citation[],
+  answer: string,
+): Citation[] {
+  const byScore = (a: Citation, b: Citation) =>
+    (b.score ?? 0) - (a.score ?? 0);
+
+  const mentioned = (c: Citation) => {
+    if (answer.includes(c.path)) return true;
+    // Also match a bare file name, e.g. the model wrote `chat.ts` not the path.
+    const base = c.path.split("/").pop();
+    return !!base && new RegExp(`(^|[\\s\\\`(/])${escapeRegExp(base)}\\b`).test(answer);
+  };
+
+  const relevant = all.filter(mentioned).sort(byScore);
+  if (relevant.length > 0) return relevant.slice(0, 8);
+
+  // No inline citations found — the model likely answered without pointing at
+  // specific files. Surface the best-scored hits so the user still gets sources.
+  return all.sort(byScore).slice(0, 8);
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** True when an LLM error is a rate-limit / quota exhaustion worth retrying. */
+function isRateLimited(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? err);
+  return /Too Many Requests|429|rate.?limit|quota|RESOURCE_EXHAUSTED/i.test(msg);
+}
+
 function systemPrompt(mode: ChatMode, slug: string): string {
   const common =
     `You are Matrisite, a codebase guide for the GitHub repository "${slug}". ` +
     `Always answer in the SAME language the user writes in. ` +
     `Ground every claim in the ACTUAL code: call searchCode (and findSymbol / readFile / getFileTree as needed) BEFORE answering. ` +
-    `Never invent files, functions, or APIs. When you reference code, cite it inline as \`path:line\`. ` +
+    `Never invent files, functions, or APIs. ` +
+    `MANDATORY CITATIONS: whenever you mention a file, function, symbol, or behavior, cite the exact source inline as \`path:line\` (use \`path:startLine-endLine\` for a range). ` +
+    `Every key file your answer relies on MUST appear at least once as an inline \`path:line\` citation using the REAL path returned by the tools — never a bare file name, a guessed path, or a paraphrase. ` +
+    `Cite only files you actually opened via the tools this turn; do not cite files you merely considered. ` +
     `If the codebase doesn't contain the answer, say so honestly.`;
 
   if (mode === "plan") {
