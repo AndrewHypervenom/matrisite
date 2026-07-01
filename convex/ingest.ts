@@ -233,6 +233,7 @@ async function indexOneFile(
   const symbols = extractSymbols(path, content);
   if (chunks.length === 0) return 0;
 
+  await paceEmbedding();
   await withRetry(() =>
     rag.add(ctx, {
       namespace: repoId,
@@ -270,11 +271,38 @@ async function indexOneFile(
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Proactive throttle between embedding requests.
+ *
+ * Voyage's free tier without a payment method allows only ~3 requests/min, so
+ * embedding files back-to-back immediately trips 429 and burns the retry budget
+ * on every file — a large repo then fails outright ("Too Many Requests"). By
+ * spacing calls out to at most one per `EMBED_MIN_INTERVAL_MS` we mostly stay
+ * under the limit and let `withRetry` handle the occasional overflow instead of
+ * fighting the limit head-on. Default 20s ≈ 3/min (matching the free tier); set
+ * `EMBED_MIN_INTERVAL_MS=0` once a Voyage payment method lifts the cap.
+ *
+ * State is module-level and resets each action invocation, which is exactly the
+ * scope we want: pacing only needs to hold within a single batch.
+ */
+const EMBED_MIN_INTERVAL_MS = Number(
+  process.env.EMBED_MIN_INTERVAL_MS ?? 20_000,
+);
+let lastEmbedAt = 0;
+async function paceEmbedding(): Promise<void> {
+  if (EMBED_MIN_INTERVAL_MS <= 0) return;
+  const wait = lastEmbedAt + EMBED_MIN_INTERVAL_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastEmbedAt = Date.now();
+}
+
+/**
  * Retry a rate-limited embedding call with exponential backoff. Voyage returns
  * 429 ("Too Many Requests") when the free-tier limit is exceeded; waiting and
  * retrying lets a full index pass finish instead of aborting the whole repo.
+ * Backoff ramps to a full minute because the free-tier limit resets per-minute,
+ * so shorter waits keep colliding with the same window.
  */
-async function withRetry<T>(fn: () => Promise<T>, attempts = 6): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, attempts = 8): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -284,7 +312,9 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 6): Promise<T> {
       const rateLimited = /Too Many Requests|429|rate.?limit/i.test(msg);
       if (!rateLimited || i === attempts - 1) throw err;
       lastErr = err;
-      await sleep(Math.min(30_000, 3_000 * 2 ** i)); // 3s,6s,12s,24s,30s…
+      // 5s,10s,20s,40s,60s,60s,60s… plus jitter to desync retries.
+      const backoff = Math.min(60_000, 5_000 * 2 ** i);
+      await sleep(backoff + Math.random() * 1_000);
     }
   }
   throw lastErr;
