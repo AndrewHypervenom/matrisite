@@ -21,6 +21,9 @@ export default defineSchema({
     fileCount: v.optional(v.number()),
     chunkCount: v.optional(v.number()),
     indexedAt: v.optional(v.number()),
+    // Live progress while status === "indexing" (drained batch by batch).
+    filesProcessed: v.optional(v.number()),
+    filesTotal: v.optional(v.number()),
   }).index("by_owner_name", ["owner", "name"]),
 
   // Flattened file tree of the latest indexed commit (the "repo map").

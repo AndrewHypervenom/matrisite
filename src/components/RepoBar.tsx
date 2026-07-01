@@ -69,6 +69,9 @@ export function RepoBar({
             }`}
           >
             {STATUS_LABEL[active.status] ?? active.status}
+            {active.status === 'indexing' && active.filesTotal
+              ? ` · ${active.filesProcessed ?? 0}/${active.filesTotal} archivos`
+              : ''}
             {active.status === 'ready' && active.fileCount
               ? ` · ${active.fileCount} archivos`
               : ''}

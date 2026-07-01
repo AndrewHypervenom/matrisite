@@ -107,6 +107,18 @@ export const setStatus = internalMutation({
   },
 });
 
+/** Update the live file-processing progress shown while indexing. */
+export const setProgress = internalMutation({
+  args: {
+    repoId: v.id("repos"),
+    filesProcessed: v.number(),
+    filesTotal: v.number(),
+  },
+  handler: async (ctx, { repoId, filesProcessed, filesTotal }) => {
+    await ctx.db.patch(repoId, { filesProcessed, filesTotal });
+  },
+});
+
 /** Delete all files + symbols for a repo (start of a full re-index). */
 export const clearRepo = internalMutation({
   args: { repoId: v.id("repos") },

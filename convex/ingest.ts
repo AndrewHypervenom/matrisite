@@ -12,9 +12,16 @@ import {
 } from "./github";
 
 const MAX_FILES = 600; // safety cap for a single index pass
-// Voyage's free tier is aggressively rate-limited (especially without a payment
-// method on file). Index serially and back off on 429 so a full pass completes.
-const CONCURRENCY = 1;
+// Voyage's free tier is aggressively rate-limited (~3 requests/min without a
+// payment method on file). We embed serially and back off on 429. A large repo
+// therefore can't finish inside Convex's 600s action limit in one shot, so
+// indexing is split into self-rescheduling batches (see `indexBatch`): each
+// invocation embeds files until a time budget is hit, then schedules the next
+// batch until the whole queue is drained.
+//
+// Keep this comfortably under the 600s action limit. Worst case a single file's
+// retry ladder adds ~90s on top, leaving ample slack.
+const BATCH_BUDGET_MS = 6 * 60 * 1000;
 
 type RepoDoc = {
   _id: any;
@@ -23,7 +30,11 @@ type RepoDoc = {
   defaultBranch?: string;
 };
 
-/** Full (re)index of a repository. */
+// One file's worth of work queued for a batch. `blobSha` is present for a full
+// index (enables content-hash dedup) and omitted for incremental re-indexes.
+const queueItem = v.object({ path: v.string(), blobSha: v.optional(v.string()) });
+
+/** Full (re)index of a repository. Enumerates files, then hands off to batches. */
 export const indexRepo = internalAction({
   args: { repoId: v.id("repos") },
   handler: async (ctx, { repoId }) => {
@@ -48,20 +59,20 @@ export const indexRepo = internalAction({
 
       // Fresh index: clear the previous repo map (RAG entries are replaced by key).
       await ctx.runMutation(internal.repos.clearRepo, { repoId });
-
-      let chunkTotal = 0;
-      await pool(targets, CONCURRENCY, async (entry) => {
-        const added = await indexOneFile(ctx, repo, repoId, sha, entry.path, entry.sha);
-        chunkTotal += added;
+      await ctx.runMutation(internal.repos.setProgress, {
+        repoId,
+        filesProcessed: 0,
+        filesTotal: targets.length,
       });
 
-      await ctx.runMutation(internal.repos.finishIndex, {
+      await ctx.scheduler.runAfter(0, internal.ingest.indexBatch, {
         repoId,
         sha,
-        fileCount: targets.length,
-        chunkCount: chunkTotal,
-        indexedAt: Date.now(),
-        defaultBranch: branch,
+        branch,
+        mode: "full",
+        queue: targets.map((e) => ({ path: e.path, blobSha: e.sha })),
+        totalFiles: targets.length,
+        chunkTotal: 0,
       });
     } catch (err: any) {
       await ctx.runMutation(internal.repos.setStatus, {
@@ -101,19 +112,106 @@ export const reindexChangedPaths = internalAction({
       await ctx.runMutation(internal.repos.removeFile, { repoId, path });
     }
 
-    // Upserts
+    // Upserts — hand off to the same batched pipeline so a large push can't
+    // blow the action time limit.
     const changed = [...new Set([...added, ...modified])].filter((p) =>
       shouldIndex(p),
     );
-    await pool(changed, CONCURRENCY, async (path) => {
-      await indexOneFile(ctx, repo, repoId, sha, path);
+    await ctx.runMutation(internal.repos.setProgress, {
+      repoId,
+      filesProcessed: 0,
+      filesTotal: changed.length,
     });
-
-    await ctx.runMutation(internal.repos.finishIndexIncremental, {
+    await ctx.scheduler.runAfter(0, internal.ingest.indexBatch, {
       repoId,
       sha,
-      indexedAt: Date.now(),
+      mode: "incremental",
+      queue: changed.map((path) => ({ path })),
+      totalFiles: changed.length,
+      chunkTotal: 0,
     });
+  },
+});
+
+/**
+ * Embed one time-bounded batch of the queue, then schedule the next batch (or
+ * finish). Splitting the work this way keeps every invocation well under the
+ * 600s action limit, so a rate-limited index always completes instead of being
+ * killed mid-pass and leaving the repo stuck on "indexing".
+ */
+export const indexBatch = internalAction({
+  args: {
+    repoId: v.id("repos"),
+    sha: v.string(),
+    branch: v.optional(v.string()),
+    mode: v.string(), // full | incremental
+    queue: v.array(queueItem),
+    totalFiles: v.number(),
+    chunkTotal: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const { repoId, sha, branch, mode, queue, totalFiles } = args;
+    const repo = (await ctx.runQuery(internal.repos.getRepoInternal, {
+      repoId,
+    })) as RepoDoc | null;
+    if (!repo) return;
+
+    try {
+      const deadline = Date.now() + BATCH_BUDGET_MS;
+      let chunkTotal = args.chunkTotal;
+      let i = 0;
+      while (i < queue.length && Date.now() < deadline) {
+        const item = queue[i];
+        chunkTotal += await indexOneFile(
+          ctx,
+          repo,
+          repoId,
+          sha,
+          item.path,
+          item.blobSha,
+        );
+        i++;
+      }
+
+      const rest = queue.slice(i);
+      await ctx.runMutation(internal.repos.setProgress, {
+        repoId,
+        filesProcessed: totalFiles - rest.length,
+        filesTotal: totalFiles,
+      });
+
+      if (rest.length > 0) {
+        await ctx.scheduler.runAfter(0, internal.ingest.indexBatch, {
+          ...args,
+          queue: rest,
+          chunkTotal,
+        });
+        return;
+      }
+
+      if (mode === "full") {
+        await ctx.runMutation(internal.repos.finishIndex, {
+          repoId,
+          sha,
+          fileCount: totalFiles,
+          chunkCount: chunkTotal,
+          indexedAt: Date.now(),
+          defaultBranch: branch,
+        });
+      } else {
+        await ctx.runMutation(internal.repos.finishIndexIncremental, {
+          repoId,
+          sha,
+          indexedAt: Date.now(),
+        });
+      }
+    } catch (err: any) {
+      await ctx.runMutation(internal.repos.setStatus, {
+        repoId,
+        status: "error",
+        lastError: String(err?.message ?? err),
+      });
+    }
   },
 });
 
@@ -190,20 +288,4 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 6): Promise<T> {
     }
   }
   throw lastErr;
-}
-
-/** Bounded-concurrency map. */
-async function pool<T>(
-  items: T[],
-  size: number,
-  fn: (item: T) => Promise<void>,
-): Promise<void> {
-  let i = 0;
-  const workers = Array.from({ length: Math.min(size, items.length) }, async () => {
-    while (i < items.length) {
-      const idx = i++;
-      await fn(items[idx]);
-    }
-  });
-  await Promise.all(workers);
 }
